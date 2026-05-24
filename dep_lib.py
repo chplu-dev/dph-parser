@@ -1,0 +1,1669 @@
+import os, re, random, copy
+from itertools import groupby
+import itertools
+
+random.seed(0)
+
+#24 May 2026
+#fix conll parses where an id has a head at one line, while it points the other way in another line
+def clean_cyclic_conll(conll_str,params={}):
+  replace_head_with=params.get("replace_head_with","0")
+  conll_obj_list=conll2obj(conll_str)
+  used_id_head_pairs=[]
+  new_obj_list=[]
+  for o1 in conll_obj_list:
+    id0,head0=o1["id"],o1["head"]
+    if (head0,id0) in used_id_head_pairs: 
+      head0=replace_head_with
+      o1["head"]=head0
+    used_id_head_pairs.append((id0,head0))
+    new_obj_list.append(o1)
+  return obj2conll(new_obj_list)
+
+
+
+#2 Feb 2026
+#converting dependency object to constituency structure (with multiple options for projections and final format)
+class dep_const:
+  def __init__(self,dep_obj,params={}) -> None:
+    self.dep_obj=dep_obj #obtaining basic info from the dependency object
+    self.id_list,self.heads,self.words=[],[],[]
+    self.id_info_dict={}
+    self.head_children_dict={}
+    self.id_projection_dict={}
+
+    for it0 in dep_obj:
+      id0,head0,word0=it0["id"],it0["head"],it0["form"]
+      self.id_list.append(id0)
+      self.heads.append(head0)
+      self.words.append(word0)
+      self.id_info_dict[id0]=it0
+      self.head_children_dict[head0]=self.head_children_dict.get(head0,[])+[id0] #identify the ids of children corresponding to current head
+    #print(self.words)
+
+    childless_ids=list(set(self.id_list).difference(set(self.head_children_dict))) #tokens that are not heads/have no children
+    childless_ids.sort(key=lambda x:int(x))
+
+    for ch_id in childless_ids: #creating projections for tokens without children
+      cur_info=self.id_info_dict[ch_id]
+      loc_i=int(ch_id)-1
+      phrase_obj={"cat": cur_info["xpos"],"word": cur_info["form"], "deprel":cur_info["deprel"],"upos":cur_info["upos"], "xpos":cur_info["xpos"],"children":[],"id":ch_id,"start":loc_i,"end":loc_i,"span":1, "rule":"","level":0}
+      phrase_obj["ptb"]=f'({phrase_obj["cat"]} {phrase_obj["word"]})'
+      cur_proj_list=[phrase_obj]
+
+      phrase_obj1=copy.deepcopy(phrase_obj)
+      phrase_cat=None
+      if cur_info["upos"].lower()=="noun" or cur_info["deprel"].lower().startswith(("nsubj","nobj")): phrase_cat="NP"
+      if cur_info["upos"].lower()=="verb": phrase_cat="VP"
+      if cur_info["upos"].lower()=="adj": phrase_cat="AP"
+      if phrase_cat!=None:
+        phrase_obj1["cat"]=phrase_cat
+        phrase_obj["ptb"]=f'({phrase_cat} {phrase_obj["word"]})'
+        phrase_obj1["level"]=1
+        cur_proj_list.append(phrase_obj1)
+      self.id_projection_dict[ch_id]=cur_proj_list
+
+    #iterating over remaining tokens that are heads, stop when all are projected
+    while len(self.id_projection_dict)<len(self.id_list):
+      for head_id,ch_id_list in self.head_children_dict.items():
+        if self.id_projection_dict.get(head_id)!=None: continue #already projected - skip
+        head_info=self.id_info_dict.get(head_id)
+        if head_info==None: continue #mainly zero/root heads
+
+        head_id_int=int(head_id)
+        head_level=head_info.get("level",0)
+        child_projection_list=[]
+        child_sorting_list=[]
+        all_children_projected=True
+        #identifying and sorting children
+        for ch0 in ch_id_list:
+          ch_id_int=int(ch0)
+          offset0=head_id_int-ch_id_int
+          #offset0=ch_id_int-head_id_int
+          ch_proj0=self.id_projection_dict.get(ch0)
+          if ch_proj0==None: #if a child is not projected yet, we skip this head
+            all_children_projected=False
+            break
+          highest_ch_proj=ch_proj0[-1]
+          ch_ch_upos=highest_ch_proj["upos"]
+          ch_ch_cat=highest_ch_proj["cat"]
+          ch_ch_deprel=highest_ch_proj["deprel"]
+          abs_offset=abs(offset0)
+          direction0=int(offset0/abs_offset)
+          ch_sorting_obj={"id": ch0,"offset":abs_offset,"direction":direction0,"upos":ch_ch_upos,"cat":ch_ch_cat,"deprel":ch_ch_deprel}
+          child_sorting_list.append(ch_sorting_obj)
+
+          child_projection_list.append(ch_proj0)
+
+        if not all_children_projected: continue
+
+        head_loc_i=head_id_int-1
+        #head_level+=1
+        head_phrase_obj={"cat":head_info["xpos"],"word": head_info["form"],"upos":head_info["upos"],"xpos":head_info["xpos"],"deprel":head_info["deprel"],"children":[],"id":head_id,"start":head_loc_i,"end":head_loc_i,"span":1,"rule":""}
+        head_phrase_obj["ptb"]=f'({head_phrase_obj["cat"]} {head_phrase_obj["word"]})'
+        cur_head_projections=[head_phrase_obj]
+        head_phrase_obj1=copy.deepcopy(head_phrase_obj)
+        phrase_cat=None
+        if head_phrase_obj["upos"].lower()=="noun" or head_phrase_obj["deprel"].lower().startswith(("nsubj","nobj")): phrase_cat="NP"
+        if head_phrase_obj["upos"].lower()=="verb": phrase_cat="VP"
+        if head_phrase_obj["upos"].lower()=="adj": phrase_cat="AP"
+        if phrase_cat!=None:
+          head_phrase_obj1["cat"]=phrase_cat
+          head_phrase_obj1["ptb"]=f'({phrase_cat} {head_phrase_obj1["word"]})'
+          head_phrase_obj1["level"]=1
+          cur_head_projections.append(head_phrase_obj1)
+
+
+        child_sorting_list.sort(key=lambda x:(x["direction"],x["offset"])) #we sort children IDs based on direction and distance from the head, we go right firest, from closer to farther, and then go left the same way
+        
+        
+        for ch_sort0 in child_sorting_list: 
+          ch_proj=self.id_projection_dict[ch_sort0["id"]][-1]
+          hightest_cur_proj=cur_head_projections[-1] #we get the hightest projection for each new child/dependency
+          new_combined_projection=copy.deepcopy(hightest_cur_proj)
+          new_combined_projection["children"]+=[ch_sort0["id"]]
+
+          head_cat0=hightest_cur_proj["cat"]
+          head_word0=hightest_cur_proj["word"]
+          head_ptb0=hightest_cur_proj["ptb"]
+          original_head_cat=str(head_cat0)
+          ch_cat0=ch_proj["cat"]
+          ch_word0=ch_proj["word"]
+          ch_deprel0=ch_proj["deprel"]
+          ch_ptb0=ch_proj["ptb"]
+
+          direction0=ch_sort0["direction"]
+
+          head_xpos=hightest_cur_proj["xpos"]
+          ch_xpos=ch_proj["xpos"]
+
+          ch_start0,ch_end0=ch_proj["start"],ch_proj["end"]
+          highest_proj_start0,highest_proj_end0=hightest_cur_proj["start"],hightest_cur_proj["end"]
+
+          new_start=min(hightest_cur_proj["start"],ch_proj["start"])
+          new_end=max(hightest_cur_proj["end"],ch_proj["end"])
+          new_span=new_end-new_start+1
+
+          #direction0=ch_sort0["direction"]
+          if direction0==1 and ch_sort0["cat"]=="NP" and head_cat0=="VP": head_cat0="S"
+          if ch_sort0["deprel"].lower().startswith("nsubj") and head_cat0=="VP": head_cat0="S"
+          if direction0==1 and ch_sort0["upos"]=="ADP" and head_cat0=="NP": head_cat0="PP"
+          if direction0==1 and ch_sort0["cat"]=="CC": head_cat0="CC_"+head_cat0
+
+          new_combined_projection["cat"]=head_cat0
+          if direction0>0: #1 is left, -1 is right
+            rule=f'{head_cat0}[deprel={ch_deprel0}] --> {ch_cat0}[word={ch_word0} xpos={ch_xpos}] {original_head_cat}[word={head_word0} xpos={head_xpos}]^'
+            ptb0=f'({head_cat0} {ch_ptb0} {head_ptb0})'
+            phrase_items=self.words[ch_start0:ch_end0+1]+["| ^"]+self.words[highest_proj_start0:highest_proj_end0+1]
+            joined_phrase=" ".join(phrase_items)
+          else:
+            rule=f'{head_cat0}[deprel={ch_deprel0}] --> {original_head_cat}[word={head_word0} xpos={head_xpos}]^ {ch_cat0}[word={ch_word0} xpos={ch_xpos}]'
+            ptb0=f'({head_cat0} {head_ptb0} {ch_ptb0})'
+            phrase_items=["^"]+self.words[highest_proj_start0:highest_proj_end0+1]+["|"]+self.words[ch_start0:ch_end0+1]
+            joined_phrase=" ".join(phrase_items)
+
+          new_combined_projection["rule"]=rule
+          new_combined_projection["start"]=new_start
+          new_combined_projection["end"]=new_end
+          new_combined_projection["span"]=new_span
+          phrase0=" ".join(self.words[new_start:new_end+1])
+          new_combined_projection["phrase"]=phrase0
+          new_combined_projection["joined_phrase"]=joined_phrase
+          head_level+=1
+          new_combined_projection["level"]=head_level
+          new_combined_projection["ptb"]=ptb0
+          cur_head_projections.append(new_combined_projection)
+
+
+        self.id_projection_dict[head_id]=cur_head_projections
+    self.all_phrases=[]
+    for id0 in self.id_list:
+      projections=self.id_projection_dict[id0]
+      for pr0 in projections:
+        self.all_phrases.append(pr0)
+    self.all_phrases.sort(key=lambda x:x["span"])
+    self.ptb=self.all_phrases[-1].get("ptb","") #the PTB string for the phrase with the largest span
+
+
+
+
+
+
+#16 Dec 2025
+def iter_conll_treebank(treebank_fpath):
+  fopen=open(treebank_fpath)
+  cur_conll_str=""
+  for i0,line0 in enumerate(fopen):
+    if line0.startswith("#"): continue
+    if line0.strip()=="":
+      yield cur_conll_str
+      cur_conll_str=""
+    else:
+      line_split0=line0.strip().split("\t")
+      #id0,form0,lemma0,upos0,xpos0,feats0,head0,deprel0,deps0,misc0=line_split0[:10]
+      id0=line_split0[0]
+      if not id0.isdigit(): continue
+      cur_conll_str+=line0
+  fopen.close()
+
+#16 Dec 2025
+def conll2obj(conll_str):
+    line_obj_list=[]
+    col_headers=["id","form","lemma","upos","xpos","feats","head","deprel","deps","misc"]
+    for line0 in conll_str.split("\n"):
+        line_split0=line0.strip().split("\t")
+        if len(line_split0)<len(col_headers): continue
+        line_obj0={}
+        for cell_i,cell in enumerate(line_split0): 
+            if cell_i>len(col_headers)-1: break
+            cur_col_header=col_headers[cell_i]
+            line_obj0[cur_col_header]=cell
+        line_obj_list.append(line_obj0)
+    return line_obj_list
+
+
+#28 January 2026
+def obj2conll(dep_obj,params={}):
+    final_conll_str=""
+    ignored_cols=params.get("ignored_cols",["deps"])
+    temp_col_headers=["id","form","lemma","upos","xpos","feats","head","deprel","deps","misc"]
+    col_headers=params.get("headers",temp_col_headers)
+    for obj0 in dep_obj:
+        cur_cells=[]
+        for col0 in col_headers:
+            cur_val=obj0.get(col0,"_")
+            if col0 in ignored_cols: cur_val="_"
+            cur_cells.append(cur_val)
+        line="\t".join([str(v) for v in cur_cells])+"\n"
+        final_conll_str+=line
+    return final_conll_str
+
+
+
+
+# def get_conll(sent_input):
+#   #nlp = spacy.load("en_core_web_sm")
+#   #if type(sent_input) is list: nlp.tokenizer=nlp.tokenizer.tokens_from_list
+#   doc = nlp(sent_input)
+#   conll_2d=[]
+#   for token in doc:   
+#     token_i = token.i+1
+#     if token.i==token.head.i: head_i=0
+#     else: head_i = token.head.i+1
+#     items=[token_i,token.text, token.lemma_, token.tag_, token.pos_, "_", head_i, token.dep_,"_","_"]
+#     conll_2d.append(items)
+#   return conll_2d
+
+# def get_pos_tags(sent_input):
+#   doc = nlp(sent_input)
+#   tmp_pos_tags=[]
+#   for token in doc: tmp_pos_tags.append(token.tag_)
+#   return tmp_pos_tags
+
+
+#============ OLD ===========
+
+def get_rec_children(el0,el_child_dict0,el_list0=[],only_without_children=True):
+  #print("el0",el0)
+  cur_children0=el_child_dict0.get(el0,[])
+  if cur_children0==[]: return []
+  for ch0 in cur_children0:
+    sub_children=el_child_dict0.get(ch0,[])
+    if only_without_children and sub_children==[]: el_list0.append(ch0)
+    else: el_list0=get_rec_children(ch0,el_child_dict0,el_list0,only_without_children)
+    
+  return el_list0
+
+
+
+def dep2phrases(conll2d_input):
+  output_dict={}
+  head_dep_list=[]
+  pos_dict={}
+  max_proj_dict={}
+  #proj_span_dict={}
+  #phrase_span_dict={}
+  loc_dict={}
+  phrase_count_dict={}
+  phrase_child_dict={}
+  phrase_head_dict={}
+  phrase_head_lemma_dict={}
+  all_words=[]
+  all_lemmas=[]
+  all_pos=[]
+  for c2 in conll2d_input:
+      cur_ind,cur_word,cur_pos,cur_head=int(c2[0]),c2[1],c2[3],int(c2[6])
+      cur_lemma=c2[2]
+      all_lemmas.append(cur_lemma)
+      all_pos.append(cur_pos)
+      head_dep_list.append((cur_head,cur_ind))
+      if cur_pos[0] in "VN": phrase_label=cur_pos[0].upper()+"P"
+      elif cur_pos=="JJ": phrase_label="AP"
+      elif cur_pos=="IN": phrase_label="PP"
+      elif cur_pos=="MD": phrase_label="VP"
+      else: phrase_label="XP"
+      phrase_count=phrase_count_dict.get(phrase_label,0)
+      phrase_count_dict[phrase_label]=phrase_count+1
+      phrase_id="%s_%s"%(phrase_label,phrase_count)
+      max_proj_id="max_%s"%cur_ind
+      max_proj_dict[max_proj_id]=phrase_id
+      all_words.append(cur_word)
+      phrase_child_dict[phrase_id]=[]
+      loc_dict[phrase_id]=cur_ind-1
+      phrase_head_dict[phrase_id]=(cur_word,cur_ind-1)
+      phrase_head_lemma_dict[phrase_id]=cur_lemma
+      pos_dict[phrase_id]=cur_pos
+  head_dep_list.sort()
+  grouped=[(key,[v[1] for v in list(group)]) for key,group in groupby(head_dep_list,lambda x:x[0])]
+  grouped_dict=dict(iter(grouped)) #to show how many dependents does each token have
+  for key0,grp0 in grouped:
+    head_i=key0-1
+    dependents=[(v,abs(v-key0),len(grouped_dict.get(v,[]))) for v in grp0]
+    dependents.sort(key=lambda x:x[1:])
+    dependents=[v[0] for v in dependents]
+    max_proj_id="max_%s"%key0
+    cur_max_proj0=max_proj_dict.get(max_proj_id,"S_0")
+    cur_phrase_label=cur_max_proj0.split("_")[0]
+    for d0 in dependents:
+      dep_proj_id="max_%s"%d0
+      phrase_count=phrase_count_dict.get(cur_phrase_label,0)
+      phrase_count_dict[cur_phrase_label]=phrase_count+1
+      next_proj_phrase_id="%s_%s"%(cur_phrase_label,phrase_count)
+      cur_max_proj0=max_proj_dict.get(max_proj_id,"S_0")
+      phrase_child_dict[next_proj_phrase_id]=(cur_max_proj0,dep_proj_id)
+      max_proj_dict[max_proj_id]=next_proj_phrase_id
+      if head_i<0: continue
+      phrase_head_dict[next_proj_phrase_id]=(all_words[head_i],head_i)
+      phrase_head_lemma_dict[next_proj_phrase_id]=(all_lemmas[head_i])
+
+  children_items=phrase_child_dict.items()
+  for phrase_id0,phrase_children in children_items:
+    #print(phrase_id0,phrase_children)
+    new_children=[]
+    for child0 in phrase_children:
+      if child0==phrase_id0: continue
+      if child0.startswith("max_"): new_children.append(max_proj_dict.get(child0))
+      else: new_children.append(child0)
+    phrase_child_dict[phrase_id0]=new_children
+
+  phrase_info_dict={}
+  ch_items=phrase_child_dict.items()
+  for phrase_id0,direct_children in ch_items:
+    rec_children0=[]
+    if direct_children!=[]:
+      rec_children0=get_rec_children(phrase_id0,phrase_child_dict,[])
+      children_locs=[loc_dict.get(v) for v in rec_children0]
+      cur_span=(min(children_locs),max(children_locs))
+    else:
+      cur_span=(loc_dict.get(phrase_id0),loc_dict.get(phrase_id0))
+    cur_phrase_words=all_words[cur_span[0]:cur_span[1]+1]
+    cur_phrase_text=" ".join(cur_phrase_words)
+    cur_head=phrase_head_dict.get(phrase_id0)
+    cur_pos=pos_dict.get(phrase_id0)
+    cur_head_lemma=phrase_head_lemma_dict.get(phrase_id0)
+    tmp_dict={}
+    tmp_dict["direct_children"]=direct_children
+    tmp_dict["rec_children"]=rec_children0
+    tmp_dict["text"]=cur_phrase_text
+    tmp_dict["head"]=cur_head
+    tmp_dict["head_lemma"]=cur_head_lemma
+    tmp_dict["pos"]=cur_pos
+    tmp_dict["span"]=cur_span
+    tmp_dict["type"]=phrase_id0.split("_")[0]
+    tmp_dict["size"]=cur_span[1]-cur_span[0]+1
+
+    phrase_info_dict[phrase_id0]=tmp_dict
+  output_dict["phrase_info"]=phrase_info_dict
+  output_dict["words"]=all_words
+  output_dict["lemmas"]=all_lemmas
+  output_dict["pos"]=all_pos
+  output_dict["conll"]=conll2d_input
+  
+  return output_dict
+
+
+
+
+
+
+
+def consctv(list1): #to split a group of items into subgroups of contiguous/consecutive items
+    grouped=[[v[1] for v in group] for key,group in groupby(enumerate(list1),lambda x:x[1]-x[0])]
+    return grouped
+
+
+def conll2str(conll_list):
+    return "\n".join(["\t".join([str(v0) for v0 in v]) for v in conll_list])
+
+def printable_conll(conll_chunk):
+    conll_2d=[v.split("\t") for v in conll_chunk.split("\n") if v]
+    new_conll_str=""
+    for row in conll_2d:
+        items=[] 
+        for cell in row:
+            #if "|" in cell or cell=="_": items.append("-") #get rid of the pipes
+            if "|" in cell: items.append("_") #get rid of the pipes, for visualization
+            else: items.append(cell)
+        new_conll_str+="\t".join(items)+"\n"
+    return new_conll_str
+
+def get_conll_heads(conll_chunk):
+    conll_2d=[v.split("\t") for v in conll_chunk.split("\n") if v]
+    words_heads=[(v[1],v[6]) for v in conll_2d]
+    return words_heads
+
+
+
+def recursive_dep(node,dep_dict,child_list=[],depth=0):
+    if node!=0: child_list.append(node)
+    child_list.extend(dep_dict.get(node,[]))
+    for cc in dep_dict.get(node,[]):
+        #print "node", node, "child node", cc, "depth", depth
+        child_list=recursive_dep(cc,dep_dict,child_list,depth+1)
+    return child_list
+
+def conll2ptb(input_conll_str,bracket="(",input_pos_index=3,input_dep_index=6):
+    conll_obj=conll_new(input_conll_str,pos_index=input_pos_index,dep_index=input_dep_index)
+    cur_ptb=conll_obj.get_ptb()
+    if bracket=="[": cur_ptb=cur_ptb.replace("(","[").replace(")","]")
+    return cur_ptb
+
+def get_recursive_dep(head_index,cur_dep_dict,level=0):
+    parent_head=cur_dep_dict.get(head_index)
+    if parent_head!=None: level=get_recursive_dep(parent_head,cur_dep_dict,level+1)
+    return level
+
+def get_recursive_ancestors(head_index,cur_dep_dict,ancestors=[],level=0):
+    parent_head=cur_dep_dict.get(head_index)
+    if level>10:
+        ancestors.append("MAX_REACHED")
+        return ancestors
+    if parent_head!=None: 
+        ancestors.append(parent_head)
+        ancestors=get_recursive_ancestors(parent_head,cur_dep_dict,ancestors, level+1)
+    return ancestors
+
+def get_recursive_all_heads(cur_dep_dict,level=0): #get recursively all the heads and ancestors to each node
+    cur_list=[]
+    for ind,head in cur_dep_dict.items():
+        ancestors=get_recursive_ancestors(head,cur_dep_dict,ancestors=[],level=0)
+        all_cur_heads=[head]+ancestors
+        cur_list.append((ind,all_cur_heads))
+        #print(ind,head,ancestors)
+    return cur_list
+
+
+
+# def get_rec_children(el0,child_dict0,el_list0=[],only_without_children=True): #recursively get children of an element
+#   cur_children0=el_child_dict0.get(el0,[])
+#   if only_without_children and len(cur_children0)==0: el_list0.append(el0)
+#   else: el_list0.append(el0)
+#   for ch0 in cur_children0:
+#     el_list0=get_rec_el_children(ch0,el_child_dict0,el_list0,only_without_children)
+#   return el_list0
+
+
+
+
+def get_dep_levels(conll_str,pos_index=3,dep_index=6,drel_index=7): #get depth of each word in the dependency structure
+    conll_2d=[v.split("\t") for v in conll_str.split("\n") if v] #splitting the conll string into 2-d array
+    dep_dict={}
+    word_dict={}
+    all_heads=[]
+    all_indexes=[]
+    for c2 in conll_2d:
+        cur_index,depends_on,cur_dep_rel=int(c2[0]),int(c2[dep_index]),c2[drel_index]
+        word,pos=c2[1],c2[pos_index]
+        dep_dict[cur_index]=depends_on
+        word_dict[cur_index]=word
+        all_heads.append(depends_on)
+        all_indexes.append(cur_index)
+    all_heads=list(set(all_heads))
+    head_level_dict={}
+    max_level=0
+    for ah in all_heads:
+        cur_level=get_recursive_dep(ah,dep_dict,level=0)
+        #print ah, cur_level 
+        head_level_dict[ah]=cur_level
+        if cur_level>max_level: max_level=cur_level
+
+    index_level_dict={}
+    for cur_index in all_indexes:
+        cur_word=word_dict[cur_index]
+        cur_head=dep_dict[cur_index]
+        cur_head_level=head_level_dict[cur_head]
+        #cur_head_level_norm=2.0*cur_head_level/max_level
+
+        #print "%s\t%s"%(cur_word,cur_head_level_norm)
+        #print cur_index, cur_word, cur_head,  cur_head_level
+        index_level_dict[(cur_index,cur_head_level)]=cur_word
+    for i in range(max_level+1):
+        row_items=[]
+        for ind in all_indexes:
+            cur_item=index_level_dict.get((ind,i),"")
+            row_items.append(cur_item)
+        #print "\t".join(row_items)
+
+
+
+
+def analyze_dep_link_configs(conll_chunk): #get the dependency configuration betweeen each two consecutive words, as well as their link configuration
+    conll_2d=[v.split("\t") for v in conll_chunk.split("\n") if v]
+    new_2d=[(int(v[0]),v[1].strip("-"),int(v[6]),v[7]) for v in conll_2d]
+    all_deps=[(v[0],v[2]) for v in new_2d if v[2]!=0]
+    dep_configs=[]
+    #print all_deps
+    for di in range(len(new_2d)-1):
+        cur_item=new_2d[di]
+        next_item=new_2d[di+1]
+        cur_index,cur_word,cur_head,cur_rel=cur_item
+        next_index,next_word,next_head,next_rel=next_item
+        cur_tobi="1"
+        cur_word_split=cur_word.split("-")
+        if len(cur_word_split)>1 and cur_word_split[1][0].isdigit(): cur_tobi=cur_word_split[1]
+        cur_head_offset=0
+        next_head_offset=0
+        if cur_head!=0: cur_head_offset=cur_head-cur_index
+        if next_head!=0: next_head_offset=next_head-next_index
+
+        net_offset=next_head_offset-cur_head_offset
+
+        cur_head_offset_norm=cur_head_offset
+        if cur_head_offset<=-1: cur_head_offset_norm=-1
+        if cur_head_offset>1: cur_head_offset_norm=2
+        next_head_offset_norm=next_head_offset
+        if next_head_offset<-1: next_head_offset_norm=-2
+        if next_head_offset>=1: next_head_offset_norm=1
+
+
+
+        rightward_links=[v for v in all_deps if v[1]<v[0] and v[0]>next_index and v[1]==cur_index]
+        leftward_links=[v for v in all_deps if v[1]>v[0] and v[0]<cur_index and v[1]==next_index]
+        crossing_links=[v for v in all_deps if (v[0]<cur_index and v[1]>next_index) or (v[0]>next_index and v[1]<cur_index)]
+        #print cur_item, next_item, "ToBI", cur_tobi, "cur_head_offset", cur_head_offset_norm, "next_head_offset", next_head_offset_norm
+        dep_configs.append((cur_tobi,(cur_head_offset_norm,next_head_offset_norm),net_offset,len(rightward_links),len(leftward_links),len(crossing_links)))
+        # print cur_item, next_item
+        # print "cur_tobi", cur_tobi, "cur_head_offset", cur_head_offset, "next_head_offset", next_head_offset
+        # print "rightward_links", rightward_links, "leftward_links", leftward_links, "crossing_links", crossing_links
+        # print "------"
+    return dep_configs
+
+def check_crossing(pairs):
+    ordered_deps=[(min(v),max(v)) for v in pairs if v[1]!=0]
+    for in0,in1 in pairs:
+        if in1==0: continue
+        x0,x1=min(in0,in1),max(in0,in1)
+        if ordered_deps.count((x0,x1))>1: return True 
+        check1=[(y0,y1) for y0,y1 in ordered_deps if y0>x0 and y0<x1 and y1>x1]
+        check2=[(y0,y1) for y0,y1 in ordered_deps if y1>x0 and y1<x1 and y0<x0]
+        if check1 or check2: return True #yes there is crossing
+    return False
+
+def check_cyclic(pairs):
+    out=False
+    cur_dep_dict=dict(iter(pairs))
+    cur_list=get_recursive_all_heads(cur_dep_dict)
+    for ind,heads in cur_list:
+        #print("??????>>>",ind,heads)
+        if ind in heads: out=True #there is cyclic dependence
+        if "MAX_REACHED" in heads: out=True
+    return out
+
+
+class conll: #we will use this one, so we can convert to PTB at some point
+    def __init__(self,conll_str,pos_index=3,dep_index=6,drel_index=7,full_analysis=True): #full analysis to include syntactic constituents, phonological/prosodic chunks, and also configurations
+        self.dep_index=dep_index
+        self.drel_index=drel_index
+        self.dep_dict={} #depedency dict; which indexes depend on a given head
+        self.index_head_dict={} #what is the head of each given index
+        self.word_dict={} #this index corresponds to this word
+        self.pos_dict={} #this index corresponds to this POS
+        self.deprel_dict={} #the dependency relation of this index
+        self.head_offset_dict={} #the distance between each word and its head
+        self.index_list=[] #the list of indexes and their corresponding words
+        self.full_list=[] #the list of indexes and their corresponding words, POS and dependencies
+        self.conll_2d=[v.split("\t") for v in conll_str.split("\n") if v] #splitting the conll string into 2-d array
+        self.dep_index_pairs=[]
+        self.size=len(self.conll_2d)
+        self.all_heads=[]
+        self.all_deps=[] #index-head_index pairs
+        self.all_words=[]
+        self.all_indexes=[]
+        self.all_head_offsets=[]
+        self.basic_dep_dict={}
+        
+        
+
+        for c2 in self.conll_2d:
+            cur_index,depends_on,cur_dep_rel=int(c2[0]),int(c2[dep_index]),c2[drel_index]
+            word,pos=c2[1],c2[pos_index]
+            self.index_list.append((cur_index,word))
+            self.full_list.append((cur_index,word,pos,depends_on)) #depends on should be head_index
+            self.word_dict[cur_index]=word
+            self.pos_dict[cur_index]=pos
+            self.deprel_dict[cur_index]=cur_dep_rel
+            self.dep_dict[depends_on]=self.dep_dict.get(depends_on,[])+[cur_index]
+            self.dep_index_pairs.append((cur_index,depends_on)) #this is the one we need: pairs of indexes, heads
+            if depends_on==0: head_offset=0
+            else: head_offset=cur_index-depends_on
+            self.head_offset_dict[pos_index]=head_offset
+            self.all_heads.append(depends_on)
+            if depends_on!=0: self.all_deps.append((cur_index,depends_on)) #we will need to adjust the naming so all_deps doesn't exclude roots
+            self.index_head_dict[cur_index]=depends_on
+            self.all_words.append(word)
+            self.all_indexes.append(cur_index)
+            self.all_head_offsets.append(head_offset)
+            self.basic_dep_dict[cur_index]=depends_on
+
+        self.child_dict={} #recursively get all children and descendents
+        for dd in self.dep_dict:
+            all_children=recursive_dep(dd,self.dep_dict,[])
+            all_children=sorted(list(set(all_children)))
+            self.child_dict[dd]=all_children
+        phrase_label_counter={}
+        self.all_phrases=[]
+        for c2 in self.conll_2d:
+            cur_ind,cur_word,cur_pos,cur_head=int(c2[0]),c2[1],c2[3],int(c2[6])
+            direct_dependendents=self.dep_dict.get(cur_ind,[])
+          #print("cur_ind,cur_word,cur_pos,cur_head",cur_ind,cur_word,cur_pos,cur_head)  
+            #print("cur_ind,direct_dependendents",cur_ind,self.dep_dict.get(cur_ind,[]))        
+            cur_children=self.child_dict.get(cur_ind,[])
+            if cur_children==[]: min_child_i,max_child_i=cur_ind,cur_ind
+            else: min_child_i,max_child_i=min(cur_children),max(cur_children)
+
+          #give an ID to the current word, based on its POS
+            if not cur_pos[0].isalnum(): cur_pos="PUNCT"
+            if cur_pos.startswith("NN"): cur_pos="NN"
+            cur_phrase_count=phrase_label_counter.get(cur_pos,0)
+            cur_pos_id=cur_pos+str(cur_phrase_count+1)
+            phrase_label_counter[cur_pos]=cur_phrase_count+1
+
+          #give the phrase label to its projections
+          #print(cur_ind,cur_word,cur_pos,cur_head,direct_dependendents,[min_child_i,max_child_i])
+            if cur_pos[0] in "VN": phrase_label=cur_pos[0].upper()+"P"
+            elif cur_pos=="JJ": phrase_label="AP"
+            elif cur_pos=="IN": phrase_label="PP"
+            elif cur_pos=="MD": phrase_label="VP"
+            else: phrase_label="XP"
+
+            dependents_before=sorted([v for v in direct_dependendents if v<cur_ind],reverse=True)
+            dependents_after=[v for v in direct_dependendents if v>cur_ind]
+            prejections=dependents_after+dependents_before
+
+
+          #print(cur_pos_id,cur_ind,[cur_ind])
+            tmp_phrase_obj={}
+            tmp_phrase_obj["id"]=cur_pos_id
+            tmp_phrase_obj["head"]=cur_ind
+            tmp_phrase_obj["terminal"]=True
+            tmp_phrase_obj["range"]=(cur_ind-1,cur_ind-1) #we want the range to be based on the actual indexes of the sentence words
+            tmp_phrase_obj["text"]=cur_word
+            tmp_phrase_obj["n"]=1
+            self.all_phrases.append(tmp_phrase_obj)
+          
+
+            all_children_so_far=[cur_ind]
+
+            for pr in prejections:
+                cur_phrase_count=phrase_label_counter.get(phrase_label,0)
+                cur_phrase_id=phrase_label+str(cur_phrase_count+1)
+                phrase_label_counter[phrase_label]=cur_phrase_count+1
+                tmp_children_of_the_attached_phrase=self.child_dict.get(pr,[pr])
+                all_children_so_far.extend(list(tmp_children_of_the_attached_phrase))
+                tmp_children_so_far=sorted(list(all_children_so_far))
+                phrase_range=(min(tmp_children_so_far)-1,max(tmp_children_so_far)-1) #we want the range to be based on the actual indexes of the sentence words
+                #print("tmp_children_so_far",tmp_children_so_far,self.word_dict)
+                words=[self.word_dict[v] for v in tmp_children_so_far]
+                tmp_phrase_obj={}
+                tmp_phrase_obj["id"]=cur_phrase_id
+                tmp_phrase_obj["head"]=cur_ind
+                tmp_phrase_obj["terminal"]=False
+                tmp_phrase_obj["range"]=phrase_range
+                tmp_phrase_obj["text"]=" ".join(words)
+                tmp_phrase_obj["n"]=len(words)
+                self.all_phrases.append(tmp_phrase_obj)
+
+
+
+        self.word_dep_pairs=[(self.word_dict.get(v[0],""),self.word_dict.get(v[1],"")) for v in self.dep_index_pairs]
+        self.word_deprel_pairs=[(self.word_dict.get(v[0],""),self.deprel_dict.get(v[0],"")) for v in self.dep_index_pairs]
+        self.word_deprel_word_triplets=[(self.word_dict.get(v[0],""),self.deprel_dict.get(v[0],""),self.word_dict.get(v[1],"")) for v in self.dep_index_pairs]
+        self.word_pos_pairs=[(self.word_dict.get(v[0],""),self.pos_dict.get(v[0],"")) for v in self.dep_index_pairs]
+
+        #advanced processing of conll to get further info from the structure
+
+        #syntactic phrase geometry information
+        self.phrase_list=[]
+        self.number_phrases_end_index_list=[0]*self.size #number of phrases ending at a certain index
+        self.number_phrases_start_index_list=[0]*self.size #number of phrases starting *immediately after* the current index
+        self.size_phrases_end_index_list=[0]*self.size #size of the largest phrase ending at each index
+        self.size_phrases_start_index_list=[0]*self.size #size of the largest phrase starting *after* the current index
+
+        #depth of each word within the structure (key: word index, value, depth)
+        self.depth_dict={}
+        self.list_depths=[]
+
+        #phonological/prosodic dependency chunks, obtained by grouping each head with its adjacent non-head children 
+        self.dep_chunks=[] #the chunks of words themselves
+        self.chunk_boundaries=[0]*self.size #list of indexes, indicating whether each index correspond to chunk boundary or not
+
+        #dependency configuration
+        self.list_dep_configs_raw=[] #list of dependency configurations between each two consecutive words, with the original head offsets -6,+2
+        self.list_dep_configs=[] #same list but normalized -1,+1
+        self.list_link_configs=[] #number of leftward links, rightward links, and overhead links between each two consecutive words
+
+
+        if not full_analysis: return 
+
+        
+        for dd in self.dep_dict:
+            all_children=recursive_dep(dd,self.dep_dict,[])
+            all_children=sorted(list(set(all_children)))
+            start_i,end_i=all_children[0]-1,all_children[-1]-1
+            full_phrase=" ".join([self.word_dict[v] for v in all_children]) 
+            #print all_children, full_phrase, start_i,end_i
+
+            #print dd, self.word_dict.get(dd,""), self.pos_dict.get(dd,"root"), self.dep_dict[dd], full_phrase
+            self.phrase_list.append((dd, self.word_dict.get(dd,""), self.pos_dict.get(dd,"root"), all_children, full_phrase))
+
+        self.phrase_list.sort(key=lambda x:(x[-2][-1],-x[-2][0]))
+        #print "phrases"
+        endings=[]
+        for fl in self.phrase_list:
+            #print fl
+            endings.append(fl[3][-1])
+        #print "brackets"#, endings
+        self.num_brackets=[]
+        for ind,wd in self.index_list:
+                num_brackets=endings.count(ind)
+                #print wd, num_brackets
+                self.num_brackets.append((ind,wd,num_brackets))
+        #print ">>>", [v[-1] for v in self.num_brackets]
+        #print ">>>", self.num_brackets
+        self.number_phrases_end_index_list=[v[-1] for v in self.num_brackets]
+
+        all_phon_phrases=[]
+        for head in self.dep_dict:
+            if int(head)==0:  continue
+            dependents=self.dep_dict[head]
+            #print(head,dependents)
+            cur_phrase=[head]
+            for d in dependents:
+                if not self.dep_dict.get(d): cur_phrase.append(d)
+            cur_phrase.sort()
+            non_consecutive_phrases=consctv(cur_phrase)
+            all_phon_phrases.extend(non_consecutive_phrases)
+        all_phon_phrases.sort()
+        for ap in all_phon_phrases:
+            #print ap, [index_word_dict[v] for v in ap]
+            #print ap, " ".join([self.word_dict[v] for v in ap])
+            phrase_words=" ".join([self.word_dict[v] for v in ap])
+            self.dep_chunks.append(phrase_words)
+            last_index=ap[-1]-1
+            self.chunk_boundaries[last_index]=1
+            #print ap, phrase_words
+        #print self.chunk_boundaries
+
+        #now getting the depth =========================
+        temp_heads=list(set(self.all_heads))
+        depth_dict={}
+        #print self.dep_dict
+        max_level=0
+        for ah in temp_heads:
+            cur_level=get_recursive_dep(ah,self.index_head_dict,level=0)
+            #print ah, cur_level 
+            depth_dict[ah]=cur_level
+            if cur_level>max_level: max_level=cur_level
+        #print depth_dict
+        index_level_dict={}
+        for cur_index in self.all_indexes:
+            cur_word=self.word_dict[cur_index]
+            cur_head=self.index_head_dict[cur_index]
+            cur_head_level=depth_dict[cur_head]
+            self.list_depths.append(cur_head_level)
+            #cur_head_level_norm=2.0*cur_head_level/max_level
+
+            #print "%s\t%s"%(cur_word,cur_head_level_norm)
+            #print cur_index, cur_word, cur_head,  cur_head_level
+            index_level_dict[(cur_index,cur_head_level)]=cur_word
+        for i in range(max_level+1):
+            row_items=[]
+            for ind in self.all_indexes:
+                cur_item=index_level_dict.get((ind,i),"")
+                row_items.append(cur_item)
+            #print "\t".join(row_items)
+        tmp_depths=self.list_depths#+[-1]
+        self.depth_diff=[z1-z0 for z0,z1 in zip(tmp_depths,tmp_depths[1:])] #pairs of depths of consecutive words
+        self.depth_diff.append(-100)
+
+        new_2d=self.conll_2d
+        for di in range(len(new_2d)-1):
+            cur_index,next_index=di+1,di+2
+            cur_head=self.all_heads[di]
+            next_head=self.all_heads[di+1]
+            cur_head_offset_raw=0
+            next_head_offset_raw=0
+            if cur_head!=0: cur_head_offset_raw=cur_head-cur_index
+            if next_head!=0: next_head_offset_raw=next_head-next_index
+
+            #net_offset=next_head_offset-cur_head_offset
+
+            cur_head_offset=cur_head_offset_raw
+            if cur_head_offset_raw<=-1: cur_head_offset=-1
+            if cur_head_offset_raw>1: cur_head_offset=2
+            next_head_offset=next_head_offset_raw
+            if next_head_offset_raw<-1: next_head_offset=-2
+            if next_head_offset_raw>=1: next_head_offset=1
+            cur_config=(cur_head_offset,next_head_offset)
+            cur_raw_config=(cur_head_offset_raw,next_head_offset_raw)
+
+            self.list_dep_configs_raw.append(cur_raw_config)
+            self.list_dep_configs.append(cur_config)
+
+
+
+            rightward_links=[v for v in self.all_deps if v[1]<v[0] and v[0]>next_index and v[1]==cur_index]
+            leftward_links=[v for v in self.all_deps if v[1]>v[0] and v[0]<cur_index and v[1]==next_index]
+            crossing_links=[v for v in self.all_deps if (v[0]<cur_index and v[1]>next_index) or (v[0]>next_index and v[1]<cur_index)]
+            self.list_link_configs.append((len(rightward_links),len(leftward_links),len(crossing_links)))
+            #print cur_index,next_index, cur_config
+        self.list_dep_configs_raw.append(())
+        self.list_dep_configs.append(())
+        self.list_link_configs.append((0,0,0))
+
+        self.closing_brackets_list=self.number_phrases_end_index_list
+        self.feature_headers=["all_words", "word_dep_pairs", "all_heads","all_head_offsets","list_depths","link_configs","dep_configs", "syntactic_closing_brackets", "chunk_boundaries", "depth_diff"]
+        self.features_zipped=zip(self.all_words, self.word_dep_pairs, self.all_heads,self.all_head_offsets,self.list_depths,self.list_link_configs,self.list_dep_configs, self.number_phrases_end_index_list, self.chunk_boundaries, self.depth_diff)
+        self.features_matrix=[self.feature_headers]+list(self.features_zipped)
+        self.features_str=""
+        self.features_str+="\t".join(self.feature_headers)+"\n"
+        for z1 in self.features_zipped:
+            self.features_str+="\t".join([str(v) for v in z1])+"\n"
+
+
+
+    def get_ptb(self):             
+        projection_dict={}
+        for cl in self.full_list: #we create projections for each word, depending on POS
+            cur_index,word,pos,depends_on=cl
+            depends_on_pos=self.pos_dict.get(depends_on,"")
+            dependents=self.dep_dict.get(cur_index,[])
+            projections=[pos] #the first projection for any word is its POS tag
+            if dependents:
+                if pos[0].lower()=="n": projections+=["NP"]
+                elif pos[0].lower()=="v": 
+                    prev=[v for v in dependents if v<cur_index]
+                    if prev: projections+=["VP","S"]
+                    else: projections=["VP"]
+                elif pos[:2].lower()=="in": 
+                    projections+=["PP"]
+                elif pos[:2].lower()=="jj": 
+                    projections+=["ADJP"]
+                elif pos[:2].lower()=="rb": 
+                    projections+=["ADVP"]
+                elif pos[:2].lower()=="cd": 
+                    projections+=["NP"]
+                elif pos[:2].lower()=="uh": 
+                    projections+=["INTJ"]
+
+                else:
+                    projections=[pos,pos+"P"] #an ugly hack to differenciate between the first projection (POS tag), and a further projection if there are dependents on it
+            else:
+                if pos.lower()=="prp": 
+                    projections+=["NP"]
+
+            projection_dict[cur_index]=projections
+
+        child_parent_list=[]
+        root_node=None
+
+        for cl in self.full_list:
+            cur_index,word,pos,depends_on=cl
+            depends_on_pos=self.pos_dict.get(depends_on,"")
+            cur_projections=projection_dict[cur_index]
+            cur_projections=[word]+cur_projections
+            if depends_on==0: root_node=(cur_projections[-1],cur_index)
+            for i in range(len(cur_projections)-1): #get single word/head projections
+                child,parent=cur_projections[i],cur_projections[i+1]
+                #parent_dict[(child,cur_index)]=(parent,cur_index)
+                tmp_child,tmp_parent=(child,cur_index), (parent,cur_index)
+                child_parent_list.append((tmp_child,tmp_parent))
+            #print cl, depends_on_pos, cur_projections
+            cur_node=(cur_projections[-1],cur_index)
+            parent_node=None
+            if depends_on_pos and depends_on_pos and depends_on_pos[0].lower()=="v" and cur_index>depends_on:
+                parent_node=("VP",depends_on)
+            elif pos.lower()=="md" and depends_on_pos and depends_on_pos[0].lower()=="v":
+                parent_node=("VP",depends_on)
+
+            else: #attach the current maximal projection to the maximal project of the word that the current word depends on
+                depends_on_projections=projection_dict.get(depends_on)
+                if depends_on_projections: parent_node=(depends_on_projections[-1],depends_on)
+            if parent_node: child_parent_list.append((cur_node,parent_node)) #parent_dict[cur_node]=parent_node
+            #print "child node", cur_node, "parent node", parent_node
+        #for a in child_parent_list:
+        #   print ">>>", a
+
+        child_parent_list.sort(key=lambda x:x[1])
+        grouped=[(key,[v[0] for v in list(group)]) for key,group in groupby(child_parent_list,lambda x:x[1])]
+        self.child_dict={}
+        self.root_node=root_node
+        for k,grp in grouped: self.child_dict[k]=grp
+        self.cur_ptb=gen_ptb(self.child_dict,root_node,"")
+        #print self.cur_ptb
+        return self.cur_ptb
+    def augment(self,seed_uas=0.5,max_n=20):
+        all_conll=[]
+        all_conll_uas=[]
+
+        #print(self.all_deps)
+        ordered_deps=[(min(v),max(v)) for v in self.all_deps]
+        #print(ordered_deps)
+        uas_vals=[0.1,0.25,0.5,0.75,0.9] #scattered seed values to make sure we have a wide diversity of UAS values
+        #uas_vals=[0.1,0.25,0.5]
+        for seed_uas in uas_vals:
+
+        #print(self.basic_dep_dict)
+        #print(self.all_indexes)
+            self.possible_heads_dict={}
+            self.possible_heads_list=[]
+            gold_list=[]
+            for in0 in self.all_indexes:
+                actual_head=self.basic_dep_dict[in0]
+                gold_list.append((in0,actual_head))
+                #print(">>>>", in0,actual_head)
+                cur_possibilities=[actual_head]
+                if actual_head==0: 
+                    self.possible_heads_dict[in0]=cur_possibilities
+                    self.possible_heads_list.append([(in0,actual_head)])
+                    continue
+                for in1 in self.all_indexes:
+                    if in1==in0: continue
+                    if in1==actual_head: continue
+                    #print(">>>> !!!!", in0,in1,actual_head)
+                    x0,x1=min(in0,in1),max(in0,in1)
+                    check1=[(y0,y1) for y0,y1 in ordered_deps if y0>x0 and y0<x1 and y1>x1]
+                    check2=[(y0,y1) for y0,y1 in ordered_deps if y1>x0 and y1<x1 and y0<x0]
+
+                    if check1 or check2: continue
+
+                    cur_possibilities.append(in1)
+                self.possible_heads_dict[in0]=cur_possibilities
+                cur_items=[(in0,v) for v in cur_possibilities]
+                self.possible_heads_list.append(cur_items)
+
+            final_list=[]
+            
+            for _ in range(200):
+                final_list=[]
+                rel_list=[]
+                if len(all_conll_uas)>max_n: break
+                for a in self.possible_heads_list:
+                    #print(a)
+                    a1=a[1:]
+                    if not a1: 
+                        final_list.append(a[0])
+                        rel_list.append("")
+                    else:
+                        rand_val=random.random()
+                        if rand_val>seed_uas:
+                            random.shuffle(a1)
+                            final_list.append(a1[0])
+                            rel_list.append("dep")
+                        else:
+                            final_list.append(a[0])
+                            rel_list.append("")
+
+                correct=list(set(gold_list).intersection(final_list))
+                new_uas=float(len(correct))/len(gold_list)
+                new_conll_2d=[]
+                new_gen_conll_str=""
+                for ci,c2 in enumerate(self.conll_2d):
+                    ind,head=final_list[ci]
+                    new_row=list(c2)
+                    cur_rel=rel_list[ci]
+                    if cur_rel!="": new_row[self.drel_index]=cur_rel
+                    new_row[self.dep_index]=head
+                    new_conll_2d.append(new_row)
+                    new_gen_conll_str+="\t".join([str(v) for v in new_row])+"\n"
+                info_row=["_"]*len(new_row)
+                info_row[0]=len(self.conll_2d)+1
+                info_row[self.dep_index]=0
+                info_row[self.drel_index]="-"
+                info_row[3]="UAS"
+                info_row[1]=round(new_uas,2)
+                new_conll_2d.append(info_row)
+                #new_gen_conll_str+="\t".join([str(v) for v in info_row])+"\n"
+                if new_gen_conll_str in all_conll: continue
+                all_conll.append(new_gen_conll_str)
+                
+                
+                #conll_str="\n".join(["\t".join()])
+                crossing_exists=check_crossing(final_list)
+                cyclic_exists=check_cyclic(final_list)
+                #print(crossing_exists,cyclic_exists)
+
+                #print("--------")
+                if not cyclic_exists and not crossing_exists:
+                    all_conll_uas.append((new_gen_conll_str,new_uas))
+                    #print(new_gen_conll_str)
+                    #print
+        #print(len(all_conll))
+        return all_conll_uas
+
+            #if crossing_exists==False: break
+
+
+
+
+
+
+
+
+
+
+
+            
+            #print(a1)
+            
+            #print(rand_val)
+            #print("-----")
+
+        # combinations=list(itertools.product(*self.possible_heads_list))
+        # print(len(combinations))
+        # for cmb in combinations[:10]:
+        #   print(cmb)
+        # print("-----")
+        # print(gold_list)
+        # print("-----")
+        # print(final_list)
+        
+        # print(check_crossing(final_list))
+        # print(len(correct),)
+        # print("=====")
+
+
+
+
+
+def merge_conll_acoustics(conll_st,acoustics_list): #to add the acoustics info into the conll
+    pass
+
+def visualize_dep(conll_str):
+    pass
+
+# def dep2const(conll_str,dep_index=6,drel_index=7):
+#   dep_dict={}
+#   pos_dict={}
+#   conll_2d=[v.split("\t") for v in conll_str.split("\n") if v]
+#   our_list=[]
+#   for c2 in conll_2d: #extracting info from the conll 2-d array
+#       cur_index,depends_on,cur_dep_rel=int(c2[0]),int(c2[dep_index]),c2[drel_index]
+#       word,pos=c2[1],c2[3]
+#       our_list.append((cur_index,word,pos,depends_on))
+#       dep_dict[depends_on]=dep_dict.get(depends_on,[])+[cur_index]
+#       pos_dict[cur_index]=pos
+
+#   projection_dict={}
+#   for cl in our_list: #we create projections for each word, depending on POS
+#       cur_index,word,pos,depends_on=cl
+#       depends_on_pos=pos_dict.get(depends_on,"")
+#       dependents=dep_dict.get(cur_index,[])
+#       projections=[pos]
+#       if dependents:
+#           if pos[0].lower()=="n": projections+=["NP"]
+#           elif pos[0].lower()=="v": 
+#               prev=[v for v in dependents if v<cur_index]
+#               if prev: projections+=["VP","S"]
+#               else: projections=["VP"]
+#           elif pos[:2].lower()=="in" or pos.lower()=="p": 
+#               projections+=["PP"]
+#           elif pos[:2].lower()=="jj": 
+#               projections+=["ADJP"]
+#           elif pos[:2].lower()=="rb": 
+#               projections+=["ADVP"]
+#           elif pos[:2].lower()=="cd": 
+#               projections+=["NP"]
+
+#           else:
+#               projections=[pos,pos+"P"] #an ugly hack to differenciate between the first projection (POS tag), and a further projection if there are dependents on it
+#       else:
+#           if pos.lower()=="prp": 
+#               projections+=["NP"]
+
+#       projection_dict[cur_index]=projections
+
+#   child_parent_list=[]
+#   root_node=None
+
+#   for cl in our_list:
+#       cur_index,word,pos,depends_on=cl
+#       depends_on_pos=pos_dict.get(depends_on,"")
+#       cur_projections=projection_dict[cur_index]
+#       cur_projections=[word]+cur_projections
+#       if depends_on==0: root_node=(cur_projections[-1],cur_index)
+#       for i in range(len(cur_projections)-1): #get single word/head projections
+#           child,parent=cur_projections[i],cur_projections[i+1]
+#           #parent_dict[(child,cur_index)]=(parent,cur_index)
+#           tmp_child,tmp_parent=(child,cur_index), (parent,cur_index)
+#           child_parent_list.append((tmp_child,tmp_parent))
+#       #print cl, depends_on_pos, cur_projections
+#       cur_node=(cur_projections[-1],cur_index)
+#       parent_node=None
+#       if depends_on_pos and depends_on_pos[0].lower()=="v" and cur_index>depends_on:
+#           parent_node=("VP",depends_on)
+#       elif pos.lower()=="md" and depends_on_pos[0].lower()=="v":
+#           parent_node=("VP",depends_on)
+
+#       else: #attach the current maximal projection to the maximal project of the word that the current word depends on
+#           depends_on_projections=projection_dict.get(depends_on)
+#           if depends_on_projections: parent_node=(depends_on_projections[-1],depends_on)
+#       if parent_node: child_parent_list.append((cur_node,parent_node)) #parent_dict[cur_node]=parent_node
+#       #print "child node", cur_node, "parent node", parent_node
+
+#   child_parent_list.sort(key=lambda x:x[1])
+#   grouped=[(key,[v[0] for v in list(group)]) for key,group in groupby(child_parent_list,lambda x:x[1])]
+#   child_dict={}
+#   for k,grp in grouped:
+#       #print k, grp
+#       child_dict[k]=grp
+#   #print root_node
+    
+#   cur_prb=gen_ptb(child_dict,root_node,"")
+#   print cur_prb
+#   return cur_prb
+
+
+
+def gen_ptb(input_child_dict,node,ptb_str,depth=0):  #nodes are in the form of ("S",5)
+    #op_br,cl_br="[","]"
+    op_br,cl_br="(",")"
+    cur_children=input_child_dict.get(node,[])
+    if not cur_children: 
+        ptb_str+=node[0]
+        return ptb_str
+    ptb_str+=op_br+node[0]+" "
+    for cc in cur_children:
+        ptb_str=gen_ptb(input_child_dict,cc,ptb_str,depth+1)
+    ptb_str+=cl_br
+    return ptb_str
+
+
+def get_phon_phrases(conll_chunk,dep_index=6,drel_index=7):
+    dep_dict={}
+    index_word_dict={}
+    word_dict={}
+    pos_dict={}
+    conll_2d=[v.split("\t") for v in conll_chunk.split("\n") if v]
+    for c2 in conll_2d:
+        cur_index,depends_on,cur_dep_rel=int(c2[0]),int(c2[dep_index]),c2[drel_index]
+        word,pos=c2[1],c2[3]
+        dep_dict[depends_on]=dep_dict.get(depends_on,[])+[cur_index]
+        index_word_dict[cur_index]=word
+        word_dict[cur_index]=word
+        pos_dict[cur_index]=pos
+
+    all_phon_phrases=[]
+    for head in dep_dict:
+        if int(head)==0:  continue
+        dependents=dep_dict[head]
+        #print(head,dependents)
+        cur_phrase=[head]
+        for d in dependents:
+            if not dep_dict.get(d): cur_phrase.append(d)
+        cur_phrase.sort()
+        non_consecutive_phrases=consctv(cur_phrase)
+        all_phon_phrases.extend(non_consecutive_phrases)
+        #print cur_phrase, [index_word_dict[v] for v in cur_phrase]
+        #print "-------"
+    all_phon_phrases.sort()
+    #print "--- phonological phrases ----"
+    # for ap in all_phon_phrases:
+    #   #print ap, [index_word_dict[v] for v in ap]
+    #   print " ".join([index_word_dict[v] for v in ap])
+    # print "--- syntactic phrases ----"
+    phrase_list=[]
+    all_syn_phrases=[]
+    syn_boundaries={}
+    for dd in dep_dict:
+        all_children=recursive_dep(dd,dep_dict,[])
+        all_children=sorted(list(set(all_children)))
+        full_phrase=" ".join([word_dict[v] for v in all_children]) 
+        if all_children in all_syn_phrases: continue
+        all_syn_phrases.append(all_children)
+
+        #print dd, word_dict.get(dd,""), pos_dict.get(dd,"root"), dep_dict[dd], full_phrase
+        phrase_list.append((dd, word_dict.get(dd,""), pos_dict.get(dd,"root"), all_children, full_phrase))
+        #print full_phrase, all_children
+        #print full_phrase
+        last_child=all_children[-1]
+        syn_boundaries[last_child]=syn_boundaries.get(last_child,0)+1
+    # print "--- syntactic boundaries/closing brackets ----"
+    # print syn_boundaries
+
+
+
+
+
+
+
+
+
+
+class conll_old: #class for extracting features from CoNLL string
+    def __init__(self,conll_str,dep_index=6,drel_index=7):
+        self.dep_dict={}
+        self.word_dict={}
+        self.pos_dict={}
+        self.deprel_dict={}
+        self.index_list=[]
+        self.conll_2d=[v.split("\t") for v in conll_str.split("\n") if v]
+        self.dep_index_pairs=[]
+
+        for c2 in self.conll_2d:
+            cur_index,depends_on,cur_dep_rel=int(c2[0]),int(c2[dep_index]),c2[drel_index]
+            word,pos=c2[1],c2[3]
+            self.index_list.append((cur_index,word))
+            self.word_dict[cur_index]=word
+            self.pos_dict[cur_index]=pos
+            self.deprel_dict[cur_index]=cur_dep_rel
+            self.dep_dict[depends_on]=self.dep_dict.get(depends_on,[])+[cur_index]
+            self.dep_index_pairs.append((cur_index,depends_on))
+
+        self.word_dep_pairs=[(self.word_dict.get(v[0],""),self.word_dict.get(v[1],"")) for v in self.dep_index_pairs]
+        self.word_deprel_pairs=[(self.word_dict.get(v[0],""),self.deprel_dict.get(v[0],"")) for v in self.dep_index_pairs]
+        self.word_deprel_word_triplets=[(self.word_dict.get(v[0],""),self.deprel_dict.get(v[0],""),self.word_dict.get(v[1],"")) for v in self.dep_index_pairs]
+        self.word_pos_pairs=[(self.word_dict.get(v[0],""),self.pos_dict.get(v[0],"")) for v in self.dep_index_pairs]
+
+        self.phrase_list=[]
+        for dd in self.dep_dict:
+            all_children=recursive_dep(dd,self.dep_dict,[])
+            all_children=sorted(list(set(all_children)))
+            full_phrase=" ".join([self.word_dict[v] for v in all_children]) 
+
+            #print dd, word_dict.get(dd,""), pos_dict.get(dd,"root"), dep_dict[dd], full_phrase
+            self.phrase_list.append((dd, self.word_dict.get(dd,""), self.pos_dict.get(dd,"root"), all_children, full_phrase))
+
+        self.phrase_list.sort(key=lambda x:(x[-2][-1],-x[-2][0]))
+        #print "phrases"
+        endings=[]
+        for fl in self.phrase_list:
+            #print fl
+            endings.append(fl[3][-1])
+        #print "brackets"#, endings
+        self.num_brackets=[]
+        for ind,wd in self.index_list:
+                num_brackets=endings.count(ind)
+                #print wd, num_brackets
+                self.num_brackets.append((ind,wd,num_brackets))
+
+
+cur_conll1="""
+1   and -   CC  CC  B2|C|0|-|-  3   cc  _   _
+2   you -   PRP PRP B2|-|0|-|-  3   nsubj   _   _
+3   need    -   VBP VBP B2|-|0|-|-  0   root    _   _
+4   to  -   TO  TO  B2|-|0|-|-  5   aux _   _
+5   make    -   VB  VB  B2|-|0|-|-  3   xcomp   _   _
+6   sure    -   JJ  JJ  B2|-|0|-|-  5   acomp   _   _
+7   all -   DT  DT  B2|-|0|-|-  9   predet  _   _
+8   your    -   PRP$    PRP$    B2|-|0|-|-  9   poss    _   _
+9   bills   -   NNS NNS B2|-|0|-|-  10  nsubj   _   _
+10  are -   VBP VBP B2|-|0|-|-  6   ccomp   _   _
+11  paid    -   JJ  JJ  B2|-|0|-|-  10  acomp   _   _
+"""
+"1-and-3 2-you-3 3-need-0 4-to-5 5-make-3 6-sure-5 7-all-9 8-your-9 9-bills-10 10-are-6 11-paid-10"
+cur_conll2="""
+1   and -   CC  CC  A3|C|0|-|-  9   cc  _   _
+2   uh  -   UH  UH  A3|F|0|-|-  9   discourse   _   _
+3   our -   PRP$    PRP$    A3|-|0|-|-  5   poss    _   _
+4   family  -   NN  NN  A3|-|0|-|-  5   nn  _   _
+5   income  -   NN  NN  A3|-|0|-|-  9   nsubj   _   _
+6   at  -   IN  IN  A3|-|0|-|-  5   prep    _   _
+7   this    -   DT  DT  A3|-|0|-|-  8   det _   _
+8   point   -   NN  NN  A3|-|0|-|-  6   pobj    _   _
+9   is  -   VBZ VBZ A3|-|0|-|-  0   root    _   _
+10  comfortable -   JJ  JJ  A3|-|0|-|-  13  amod    _   _
+11  upper   -   JJ  JJ  A3|-|0|-|-  13  amod    _   _
+12  middle  -   NN  NN  A3|-|0|-|-  13  nn  _   _
+13  class   -   NN  NN  A3|-|0|-|-  9   attr    _   _
+14  i   -   PRP PRP A3|-|0|-|-  15  nsubj   _   _
+15  guess   -   VBP VBP A3|-|0|-|-  9   parataxis   _   _
+16  you -   PRP PRP A3|-|0|-|-  18  nsubj   _   _
+17  might   -   MD  MD  A3|-|0|-|-  18  aux _   _
+18  say -   VB  VB  A3|-|0|-|-  9   ccomp   _   _
+"""
+
+cur_conll3="""
+1   uh  -   UH  UH  A11|F|0|-|- 4   discourse   _   _
+2   housing -   NN  NN  A11|-|0|-|- 3   nn  _   _
+3   prices  -   NNS NNS A11|-|0|-|- 4   nsubj   _   _
+4   are -   VBP VBP A11|-|0|-|- 0   root    _   _
+5   you -   PRP PRP A11|D|0|-|- 6   nsubj   _   _
+6   know    -   VBP VBP A11|D|0|-|- 4   parataxis   _   _
+7   like    -   UH  UH  A11|D|0|-|- 4   discourse   _   _
+8   from    -   IN  IN  A11|-|0|-|- 4   prep    _   _
+9   four    -   CD  CD  A11|-|0|-|- 8   pobj    _   _
+10  to  -   TO  TO  A11|-|0|-|- 12  aux _   _
+11  ten -   CD  CD  A11|-|0|-|- 12  num _   _
+12  times   -   NNS NNS A11|-|0|-|- 4   tmod    _   _
+13  more    -   RBR RBR A11|-|0|-|- 14  advmod  _   _
+14  expensive   -   JJ  JJ  A11|-|0|-|- 12  amod    _   _
+15  than    -   IN  IN  A11|-|0|-|- 14  prep    _   _
+16  uh  -   UH  UH  A11|F|0|-|- 15  discourse   _   _
+17  uh  -   UH  UH  A11|F|0|-|- 19  discourse   _   _
+18  they    -   PRP PRP A11|-|0|-|- 19  nsubj   _   _
+19  were    -   VBD VBD A11|-|0|-|- 15  dep _   _
+20  where   -   WRB WRB A11|-|0|-|- 22  advmod  _   _
+21  i   -   PRP PRP A11|-|0|-|- 22  nsubj   _   _
+22  came    -   VBD VBD A11|-|0|-|- 19  advcl   _   _
+23  from    -   IN  IN  A11|-|0|-|- 22  dep _   _
+24  in  -   IN  IN  A11|-|0|-|- 22  prep    _   _
+25  uh  -   UH  UH  A11|F|0|-|- 24  discourse   _   _
+26  dallas  -   NNP NNP A11|-|0|-|- 24  pobj    _   _
+"""
+
+cur_conll4="""
+1   when    -   WRB WRB A23|-|0|-|- 4   advmod  _   _
+2   i   -   PRP PRP A23|-|0|-|- 4   nsubj   _   _
+3   uh  -   UH  UH  A23|F|0|-|- 4   discourse   _   _
+4   was -   VBD VBD A23|-|0|-|- 0   root    _   _
+5   in  -   IN  IN  A23|-|0|-|- 4   prep    _   _
+6   uh  -   UH  UH  A23|F|0|-|- 5   discourse   _   _
+7   undergraduate   -   NN  NN  A23|-|0|-|- 8   dep _   _
+8   school  -   NN  NN  A23|-|0|-|- 5   pobj    _   _
+9   a   -   DT  DT  A23|-|0|-|- 12  det _   _
+10  long    -   JJ  JJ  A23|-|0|-|- 12  amod    _   _
+11  long    -   JJ  JJ  A23|-|0|-|- 12  amod    _   _
+12  time    -   NN  NN  A23|-|0|-|- 13  npadvmod    _   _
+13  ago -   RB  RB  A23|-|0|-|- 4   advmod  _   _
+14  i   -   PRP PRP A23|-|0|-|- 16  dep _   _
+15  uh  -   UH  UH  A23|F|0|-|- 16  discourse   _   _
+16  noted   -   VBD VBD A23|-|0|-|- 4   ccomp   _   _
+17  that    -   IN  IN  A23|-|0|-|- 25  dep _   _
+18  the -   DT  DT  A23|-|0|-|- 20  det _   _
+19  monthly -   JJ  JJ  A23|-|1|RM|RM   20  amod    _   _
+20  salary  -   NN  NN  A23|-|1|RM|RM   21  npadvmod    _   _
+21  starting    -   JJ  JJ  A23|-|0|RR|RR   25  amod    _   _
+22  average -   JJ  JJ  A23|-|0|RR|RR   25  amod    _   _
+23  monthly -   JJ  JJ  A23|-|0|RR|RR   25  amod    _   _
+24  salary  -   NN  NN  A23|-|1|RM|RM   25  nn  _   _
+25  salary  -   NN  NN  A23|-|0|RR|RR   16  dobj    _   _
+26  for -   IN  IN  A23|-|0|-|- 25  prep    _   _
+27  engineers   -   NNS NNS A23|-|0|-|- 26  pobj    _   _
+28  that    -   WDT WDT A23|-|1|RM|RM   30  dobj    _   _
+29  you -   PRP PRP A23|D|0|-|- 30  nsubj   _   _
+30  know    -   VBP VBP A23|D|0|-|- 27  rcmod   _   _
+31  in  -   IN  IN  A23|-|0|-|- 30  prep    _   _
+32  my  -   PRP$    PRP$    A23|-|0|-|- 33  poss    _   _
+33  discipline  -   NN  NN  A23|-|0|-|- 31  pobj    _   _
+34  was -   VBD VBD A23|-|0|-|- 4   dep _   _
+35  like    -   IN  IN  A23|-|0|-|- 34  discourse   _   _
+36  oh  -   UH  UH  A23|F|0|-|- 40  discourse   _   _
+37  six -   CD  CD  A23|-|0|-|- 39  number  _   _
+38  hundred -   CD  CD  A23|-|0|-|- 39  number  _   _
+39  ten -   CD  CD  A23|-|0|-|- 40  num _   _
+40  dollars -   NNS NNS A23|-|0|-|- 34  attr    _   _
+41  a   -   DT  DT  A23|-|0|-|- 42  det _   _
+42  month   -   NN  NN  A23|-|0|-|- 40  npadvmod    _   _
+43  or  -   CC  CC  A23|-|0|-|- 40  cc  _   _
+44  something   -   NN  NN  A23|-|0|-|- 40  conj    _   _
+45  like    -   IN  IN  A23|-|0|-|- 44  prep    _   _
+46  that    -   DT  DT  A23|-|0|-|- 45  pobj    _   _
+
+"""
+
+cur_conll5="""
+1   I   _   PRP PRP _   2   nsubj   _   _
+2   saw _   VB  VBD _   0   null    _   _
+3   the _   DT  DT  _   4   det _   _
+4   boy _   NN  NN  _   2   dobj    _   _
+5   with    _   IN  IN  _   4   prep    _   _
+6   the _   DT  DT  _   7   det _   _
+7   telescope   _   NN  NN  _   5   pobj    _   _
+"""
+
+cur_conll6="""
+1   I   _   PRP PRP _   2   nsubj   _   _
+2   hit _   VB  VBD _   0   null    _   _
+3   the _   DT  DT  _   4   det _   _
+4   nail    _   NN  NN  _   2   dobj    _   _
+5   with    _   IN  IN  _   2   prep    _   _
+6   the _   DT  DT  _   7   det _   _
+7   hammer  _   NN  NN  _   5   pobj    _   _
+"""
+
+cur_conll7="""
+1   the _   DT  DT  _   2   det _   _
+2   boy _   NN  NN  _   5   nsubj   _   _
+3   I   _   PRP PRP _   4   nsubj   _   _
+4   met _   VB  VBD _   2   rcmod   _   _
+5   had _   VB  VBD _   0   null    _   _
+6   a   _   DT  DT  _   7   det _   _
+7   telescope   _   NN  NN  _   5   dobj    _   _
+"""
+
+cur_conll10="""
+1   who _   NOUN    WP  _   6   dobj    _   _
+2   who _   NOUN    WP  _   4   nsubjpass   _   _
+3   's  _   VERB    VBZ _   4   auxpass _   _
+4   supposed    _   VERB    VBN _   0   ROOT    _   _
+5   to  _   PART    TO  _   6   aux _   _
+6   make    _   VERB    VB  _   4   xcomp   _   _
+7   the _   DET DT  _   8   det _   _
+8   change  _   NOUN    NN  _   6   dobj    _   _
+"""
+
+cur_conll11="""
+1   who _   PRON    WP  B54|-|1|RM|RM   4   dobj    _   _
+2   who _   PRON    WP  B54|-|0|RR|RR   4   nsubjpass   _   _
+3   's  _   VERB    VBZ B54|-|0|RR|RR   4   auxpass _   _
+4   supposed    _   VERB    VBN B54|-|0|-|- 0   ROOT    _   _
+5   to  _   PRT TO  B54|-|0|-|- 6   aux _   _
+6   make    _   VERB    VB  B54|-|0|-|- 4   xcomp   _   _
+7   the _   DET DT  B54|-|0|-|- 8   det _   _
+8   change  _   NOUN    NN  B54|-|0|-|- 6   dobj    _   _
+"""
+
+cur_conll12="""
+1   who who WP  _   _   0   root    _   O
+2   who who WP  _   _   4   nsubjpass   _   O
+3   's  's  VBZ _   _   4   auxpass _   O
+4   supposed    suppose VBN _   _   1   relcl   _   O
+5   to  to  TO  _   _   6   aux _   O
+6   make    make    VB  _   _   4   xcomp   _   O
+7   the the DT  _   _   8   det _   O
+8   change  change  NN  _   _   6   dobj    _   O
+"""
+cur_conllx="""
+1   where   _   ADV WRB _   7   advmod  _   _
+2   's  _   VERB    VBZ _   5   auxpass _   _
+3   the _   DET DT  _   4   det _   _
+4   money   _   NOUN    NN  _   5   nsubjpass   _   _
+5   supposed    _   VERB    VBN _   0   ROOT    _   _
+6   to  _   PART    TO  _   7   aux _   _
+7   come    _   VERB    VB  _   5   xcomp   _   _
+8   from    _   ADP IN  _   7   prep    _   _
+"""
+
+test="""
+1   i   -   PRP PRP _   2   nsubj   _   -
+2   think   -   VBP VBP _   0   root    _   -
+3   there   -   EX  EX  _   8   expl    _   -
+4   's  -   BES BES _   8   dep _   -
+5   a   -   DT  DT  _   8   dep _   -
+6   a   -   DT  DT  _   8   det _   -
+7   large   -   JJ  JJ  _   8   amod    _   -
+8   amount  -   NN  NN  _   2   ccomp   _   -
+9   of  -   IN  IN  _   8   prep    _   -
+10  corruption  -   NN  NN  _   9   pobj    _   -
+11  on  -   IN  IN  _   8   prep    _   -
+12  the -   DT  DT  _   11  dep _   -
+13  the -   DT  DT  _   14  det _   -
+14  have    -   NN  NN  _   11  pobj    _   -
+15  and -   CC  CC  _   14  cc  _   -
+16  the -   DT  DT  _   17  det _   -
+17  have-nots   -   NNS NNS _   14  conj    _   -
+18  you -   PRP PRP _   19  nsubj   _   -
+19  know    -   VBP VBP _   2   parataxis   _   -
+
+"""
+
+test="""
+1   i   -   PRP PRP _   2   nsubj   _   -
+2   think   -   VBP VBP _   0   root    _   -
+3   there   -   EX  EX  _   8   expl    _   -
+4   's  -   BES BES _   8   dep _   -
+5   a   -   DT  DT  _   8   dep _   -
+6   a   -   DT  DT  _   8   det _   -
+7   large   -   JJ  JJ  _   8   amod    _   -
+8   amount  -   NN  NN  _   2   ccomp   _   -
+9   of  -   IN  IN  _   8   prep    _   -
+10  corruption  -   NN  NN  _   9   pobj    _   -
+11  on  -   IN  IN  _   8   prep    _   -
+12  the -   DT  DT  _   11  dep _   -
+13  the -   DT  DT  _   14  det _   -
+14  have    -   NN  NN  _   11  pobj    _   -
+15  and -   CC  CC  _   14  cc  _   -
+16  the -   DT  DT  _   17  det _   -
+17  have-nots   -   NNS NNS _   14  conj    _   -
+18  you -   PRP PRP _   19  nsubj   _   -
+19  know    -   VBP VBP _   2   parataxis   _   -
+
+"""
+
+test2="""
+1   there   -   EX  EX  _   2   expl    _   -
+2   was -   VBD VBD _   0   root    _   -
+3   some    -   DT  DT  _   4   det _   -
+4   sort    -   NN  NN  _   2   nsubj   _   -
+5   of-2p   -   IN  IN  _   4   prep    _   -
+6   full-time-2 -   JJ  JJ  _   8   amod    _   -
+7   care-3p -   NN  NN  _   8   nn  _   -
+8   place-4 -   NN  NN  _   5   pobj    _   -
+9   that    -   WDT WDT _   12  nsubjpass   _   -
+10  was -   VBD VBD _   12  auxpass _   -
+11  also    -   RB  RB  _   12  advmod  _   -
+12  associated-2    -   VBN VBN _   8   rcmod   _   -
+13  with    -   IN  IN  _   12  prep    _   -
+14  it-4    -   PRP PRP _   13  pobj    _   -
+
+"""
+
+if __name__ == "__main__":
+    #print("dep lib")
+    import spacy
+    nlp = spacy.load("en_core_web_sm")
+
+    # conll_obj=conll(cur_conll5)
+
+    # phrases=conll_obj.phrase_list
+    # brackets=conll_obj.num_brackets
+    # index_pairs=conll_obj.dep_index_pairs
+    # dep_pairs=conll_obj.word_dep_pairs
+    # wd_deprel_pairs=conll_obj.word_deprel_pairs
+    # wd_pos_pairs=conll_obj.word_pos_pairs
+    # wd_deprel_wd=conll_obj.word_deprel_word_triplets
+
+    our_conll=test2
+    conll_obj=conll(our_conll)
+    print(our_conll)
+
+    links=conll_obj.list_link_configs
+    for l in links:
+        print(l)
+    #print(links)
+    # augmented=conll_obj.augment()
+    # for au in augmented:
+    #   print(au[0])
+    #   print(au[1])
+    #   print("-----")
+    #print(conll_obj.basic_dep_dict)
+    #cur_acestors=get_recursive_heads(12,conll_obj.basic_dep_dict,[])
+    #print(cur_acestors)
+    # our_list=get_recursive_all_heads(conll_obj.basic_dep_dict,[])
+    # for ls in our_list:
+    #   print(ls)
+
+
+    #features=conll_obj.features_str
+    #print features
+    # print conll_obj.all_words
+    # print conll_obj.all_heads
+    # print conll_obj.all_head_offsets
+    # print conll_obj.list_depths
+    # print conll_obj.list_link_configs
+    # print conll_obj.list_dep_configs
+    #zipped=zip(conll_obj.all_words, conll_obj.word_dep_pairs, conll_obj.all_heads,conll_obj.all_head_offsets,conll_obj.list_depths,conll_obj.list_link_configs,conll_obj.list_dep_configs, conll_obj.number_phrases_end_index_list, conll_obj.chunk_boundaries, conll_obj.depth_diff)
+    #for z1 in zipped:
+    #   print "\t".join([str(v) for v in z1])
+    # configs=analyze_dep_link_configs(our_conll)
+    # conll_2d=conll_obj.conll_2d
+    # for i in range(len(configs)):
+    #   c2_items=conll_2d[i]
+    #   new_items=[conll_obj.chunk_boundaries [i],conll_obj.number_phrases_end_index_list[i],configs[i][1]]
+    #   c2_items.extend(new_items)
+    #   print "\t".join([str(v) for v in c2_items])
+
+        #print "%s\t%s\t%s"%(conll_obj.chunk_boundaries [i],conll_obj.number_phrases_end_index_list[i],configs[i][1])
+    #print conll_obj.chunk_boundaries 
+    #print conll_obj.number_phrases_end_index_list
+
+    #get_phon_phrases(our_conll)
+    #print("------")
+    #print(printable_conll(our_conll))
+
+    #get_dep_levels(test)
+
+
+    # for ph in phrases:
+    #   print ">>>>", ph
+    # print "------"
+    # for br in brackets:
+    #   print br
+    # print "------"
+    # semantic_coherence_dict={}
+    # for ip in index_pairs:
+    #   d0,d1=min(ip), max(ip)
+    #   if d0==0: continue
+
+    #   #print ip, d0,d1, range(d0,d1)
+    #   for d_ in range(d0,d1):
+    #       semantic_coherence_dict[d_]=semantic_coherence_dict.get(d_,0)+1
+    # print "------"
+    # #print "now the semantic_coherence_dict"
+    # word_dict=conll_obj.word_dict
+    # keys=sorted(word_dict.keys())
+    #for k in keys:
+    #   print k, word_dict.get(k,""), semantic_coherence_dict.get(k,0)
+
+    #dep2const(cur_conll10)
+    #dep2const(cur_conll11)
+    #dep2const(cur_conll12)
+
+    # conll_obj=conll_new(test,pos_index=3)
+    # cur_ptb=conll_obj.get_ptb()
+    # print "======"
+    # print cur_ptb
+    # child_dict=conll_obj.child_dict
+    # print "======"
+    # print "root_node", conll_obj.root_node
+    # for cd in child_dict:
+    #   print cd, child_dict[cd]
+
+    # print "**********"
+    # print conll2ptb(cur_conll10,"(")
+
+    
+
+    #cur_ptb=conll_obj.get_ptb()
+    #dep2const(cur_conllx)
+
+    # for dp in dep_pairs:
+    #   print dp
+    # print "------"
+    # for wdp in wd_deprel_pairs:
+    #   print wdp
+    # print "------"
+    # for w_pos in wd_pos_pairs:
+    #   print w_pos
+    # print "------"
+    # for w_d_w in wd_deprel_wd:
+    #   print w_d_w
+    #==================
+    #cur_conll_split=
+    # dep_dict={}
+    # word_dict={}
+    # pos_dict={}
+    # index_list=[]
+    # conll_2d=[v.split("\t") for v in cur_conll2.split("\n") if v]
+    # for c2 in conll_2d:
+    #   cur_index,depends_on=int(c2[0]),int(c2[6])
+    #   word,pos=c2[1],c2[3]
+    #   index_list.append((cur_index,word))
+    #   word_dict[cur_index]=word
+    #   pos_dict[cur_index]=pos
+    #   #print word, cur_index,depends_on
+    #   dep_dict[depends_on]=dep_dict.get(depends_on,[])+[cur_index]
+    # #print [conll_2d]
+
+    # final_list=[]
+    # for dd in dep_dict:
+    #   all_children=recursive_dep(dd,dep_dict,[])
+    #   all_children=sorted(list(set(all_children)))
+    #   full_phrase=" ".join([word_dict[v] for v in all_children]) 
+
+    #   #print dd, word_dict.get(dd,""), pos_dict.get(dd,"root"), dep_dict[dd], full_phrase
+    #   final_list.append((dd, word_dict.get(dd,""), pos_dict.get(dd,"root"), all_children, full_phrase))
+    #   #all_children=[]
+
+    # final_list.sort(key=lambda x:(x[-2][-1],-x[-2][0]))
+    # print "phrases"
+    # endings=[]
+    # for fl in final_list:
+    #   print fl
+    #   endings.append(fl[3][-1])
+    # print "brackets"#, endings
+    # for ind,wd in index_list:
+    #         num_brackets=endings.count(ind)
+    #         print wd, num_brackets
+
